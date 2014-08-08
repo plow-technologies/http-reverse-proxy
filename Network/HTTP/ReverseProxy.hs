@@ -6,6 +6,7 @@ module Network.HTTP.ReverseProxy
     , rawProxyTo
       -- * WAI + http-conduit
     , waiProxyTo
+    , waiProxyToWith
     , defaultOnExc
     , waiProxyToSettings
     , WaiProxyResponse (..)
@@ -25,6 +26,7 @@ module Network.HTTP.ReverseProxy
     ) where
 
 import Data.Conduit
+import Data.Conduit.Binary (conduitFile)
 import Data.Streaming.Network (readLens, AppData)
 import Data.Functor.Identity (Identity (..))
 import Data.Maybe (fromMaybe)
@@ -51,7 +53,7 @@ import qualified Data.Set as Set
 import Data.IORef
 import qualified Data.ByteString.Lazy as L
 import Control.Concurrent.Async (concurrently)
-import Blaze.ByteString.Builder (Builder, toLazyByteString)
+import Blaze.ByteString.Builder (Builder, toLazyByteString, toByteString)
 import Data.ByteString (ByteString)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad (unless, void)
@@ -197,6 +199,16 @@ data WaiProxySettings = WaiProxySettings
     -- Since 0.3.1
     }
 
+waiProxyToWith :: Conduit ByteString IO ByteString
+                        -> (WAI.Request -> IO WaiProxyResponse)
+                        -> (SomeException -> WAI.Application)
+                        -> HC.Manager
+                        -> WAI.Request
+                        -> (WAI.Response -> IO WAI.ResponseReceived)
+                        -> IO WAI.ResponseReceived
+waiProxyToWith cnd getDest onError = waiProxyToSettingsWith cnd getDest def { wpsOnExc = onError }
+
+
 -- | How to set the X-Real-IP request header.
 --
 -- Since 0.2.0
@@ -327,6 +339,63 @@ waiProxyToSettings getDest wps manager req0 sendResponse = do
                             (HC.responseStatus res)
                             (filter (\(key, _) -> not $ key `Set.member` strippedHeaders) $ HC.responseHeaders res)
                             (\sendChunk flush -> src $= conduit $$ CL.mapM_ (\mb ->
+                                case mb of
+                                    Flush -> flush
+                                    Chunk b -> sendChunk b))
+
+
+waiProxyToSettingsWith :: Conduit ByteString IO ByteString
+                                -> (WAI.Request -> IO WaiProxyResponse)
+                                -> WaiProxySettings
+                                -> HC.Manager
+                                -> WAI.Request
+                                -> (WAI.Response -> IO WAI.ResponseReceived)
+                                -> IO WAI.ResponseReceived
+waiProxyToSettingsWith cnd getDest wps manager req0 sendResponse = do
+    edest' <- getDest req0
+    let edest =
+            case edest' of
+                WPRResponse res -> Left $ \_req -> ($ res)
+                WPRProxyDest pd -> Right (pd, req0)
+                WPRModifiedRequest req pd -> Right (pd, req)
+                WPRApplication app -> Left app
+    case edest of
+        Left app -> app req0 sendResponse
+        Right (ProxyDest host port, req) -> tryWebSockets wps host port req sendResponse $ do
+            let req' = def
+                    { HC.method = WAI.requestMethod req
+                    , HC.host = host
+                    , HC.port = port
+                    , HC.path = WAI.rawPathInfo req
+                    , HC.queryString = WAI.rawQueryString req
+                    , HC.requestHeaders = fixReqHeaders wps req
+                    , HC.requestBody = body
+                    , HC.redirectCount = 0
+                    , HC.checkStatus = \_ _ _ -> Nothing
+                    , HC.responseTimeout = wpsTimeout wps
+                    }
+                body =
+                    case WAI.requestBodyLength req of
+                        WAI.KnownLength i -> HC.RequestBodyStream
+                            (fromIntegral i)
+                            ($ WAI.requestBody req)
+                        WAI.ChunkedBody -> HC.RequestBodyStreamChunked ($ WAI.requestBody req)
+            bracket
+                (try $ HC.responseOpen req' manager)
+                (either (const $ return ()) HC.responseClose)
+                $ \ex -> do
+                case ex of
+                    Left e -> wpsOnExc wps e req sendResponse
+                    Right res -> do
+                        let conduit =
+                                case wpsProcessBody wps $ fmap (const ()) res of
+                                    Nothing -> awaitForever (\bs -> yield (Chunk $ fromByteString bs) >> yield Flush)
+                                    Just conduit' -> conduit'
+                            src = bodyReaderSource $ HC.responseBody res
+                        sendResponse $ WAI.responseStream
+                            (HC.responseStatus res)
+                            (filter (\(key, _) -> not $ key `Set.member` strippedHeaders) $ HC.responseHeaders res)
+                            (\sendChunk flush -> src $= cnd =$= conduit $$ CL.mapM_ (\mb ->
                                 case mb of
                                     Flush -> flush
                                     Chunk b -> sendChunk b))
